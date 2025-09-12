@@ -1,20 +1,52 @@
-import asyncio, aiohttp, async_timeout, random, re, os, csv, json, sys, signal, hashlib
+from __future__ import annotations
+"""
+Crawler asincrono per pagine di tracking GLS.
+- Legge un CSV con una sola colonna `url` (o la prima colonna se senza header)
+- Rispetta rate-limit (global e per host), retry con backoff + jitter
+- Cache su disco (HTML) per idempotenza
+- Parsing eventi (timestamp/descrizione/luogo) + ricostruzione soste (arrivo/partenza/dwell)
+- Output: out/events.csv, out/stops.csv
+
+Dipendenze: aiohttp, beautifulsoup4, lxml, python-dateutil, pandas, tqdm
+(Non richiede `async-timeout`; usa `asyncio.timeout` se disponibile.)
+"""
+import asyncio
+import aiohttp
+import random
+import re
+import os
+import csv
+import json
+import sys
+import signal
+import hashlib
+import time
 from pathlib import Path
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
+
 from bs4 import BeautifulSoup
 from dateutil import parser as dtparse
 import pandas as pd
 from tqdm import tqdm
-import math
+
+# ---- Timeout compatibile (senza async-timeout) --------------------------------
+try:  # Python 3.11+
+    from asyncio import timeout as aio_timeout
+except Exception:  # pragma: no cover
+    from contextlib import asynccontextmanager
+    @asynccontextmanager
+    async def aio_timeout(seconds: float):
+        # fallback: nessun timeout hard; mantiene la stessa interfaccia
+        yield
 
 # ---------------------- Config ----------------------
-CONCURRENCY = int(os.getenv("CONCURRENCY", "6"))          # max tasks in parallel
-GLOBAL_RPS   = float(os.getenv("GLOBAL_RPS", "1.5"))       # richieste/secondo totali
-PER_HOST_RPS = float(os.getenv("PER_HOST_RPS", "0.8"))
-TIMEOUT_S    = float(os.getenv("TIMEOUT_S", "12"))
-MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "6"))
-JITTER_S     = float(os.getenv("JITTER_S", "0.4"))
+CONCURRENCY = int(os.getenv("CONCURRENCY", "6"))           # task paralleli
+GLOBAL_RPS  = float(os.getenv("GLOBAL_RPS", "1.5"))        # richieste/sec globali
+PER_HOST_RPS= float(os.getenv("PER_HOST_RPS", "0.8"))      # richieste/sec per host
+TIMEOUT_S   = float(os.getenv("TIMEOUT_S", "12"))          # timeout socket
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "6"))
+JITTER_S    = float(os.getenv("JITTER_S", "0.4"))
 
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "cache"))
 RAW_DIR   = CACHE_DIR / "raw"
@@ -23,43 +55,38 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 
 UA_LIST = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3 Safari/605.1.15",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
 ]
 
 # ---------------------- Helpers ----------------------
 def extract_tracking_id(url: str) -> str:
-    """
-    Prova a ricavare un ID stabile per cache/filename.
-    Preferisce ultimo segmento numerico o parametro rf.
-    """
+    """Crea un ID stabile per cache/filename (usa `rf` se presente)."""
     q = parse_qs(urlparse(url).query)
     if "rf" in q and q["rf"]:
         return q["rf"][0]
-    # fallback: ultimo path segment
     seg = urlparse(url).path.rstrip("/").split("/")[-1]
     if seg and re.fullmatch(r"[A-Za-z0-9_-]+", seg):
         return seg
-    # hash come extrema ratio
     return hashlib.sha1(url.encode()).hexdigest()[:16]
 
-def now_utc():
+def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 class TokenBucket:
-    """Semplice rate limiter (token bucket)"""
+    """Semplice rate limiter (token bucket) senza dipendere dal loop corrente."""
     def __init__(self, rps: float):
         self.capacity = max(1.0, rps)
         self.tokens = self.capacity
         self.rps = rps
-        self.updated = asyncio.get_event_loop().time()
+        self.updated = time.perf_counter()  # monotonic clock
     async def wait(self):
         if self.rps <= 0:
             await asyncio.sleep(1)
             return
         while True:
-            now = asyncio.get_event_loop().time()
+            now = time.perf_counter()
             delta = now - self.updated
             self.updated = now
             self.tokens = min(self.capacity, self.tokens + delta * self.rps)
@@ -68,8 +95,8 @@ class TokenBucket:
                 return
             await asyncio.sleep(max(0.01, (1.0 - self.tokens) / self.rps))
 
-GLOBAL_BUCKET = TokenBucket(GLOBAL_RPS)
-HOST_BUCKETS = {}
+GLOBAL_BUCKET: TokenBucket = TokenBucket(GLOBAL_RPS)
+HOST_BUCKETS: dict[str, TokenBucket] = {}
 
 def get_host_bucket(host: str) -> TokenBucket:
     if host not in HOST_BUCKETS:
@@ -78,10 +105,10 @@ def get_host_bucket(host: str) -> TokenBucket:
 
 # ---------------------- Networking ----------------------
 async def polite_get(session: aiohttp.ClientSession, url: str) -> aiohttp.ClientResponse:
-    """GET con rate-limit globale e per host, retry/backoff/jitter e rispetto Retry-After."""
+    """GET con rate-limit, retry/backoff, jitter e rispetto di Retry-After."""
     host = urlparse(url).netloc
     backoff = 1.0
-    for attempt in range(1, MAX_RETRIES + 1):
+    for _ in range(1, MAX_RETRIES + 1):
         await GLOBAL_BUCKET.wait()
         await get_host_bucket(host).wait()
         headers = {
@@ -93,28 +120,27 @@ async def polite_get(session: aiohttp.ClientSession, url: str) -> aiohttp.Client
             "Connection": "keep-alive",
         }
         try:
-            async with async_timeout.timeout(TIMEOUT_S):
+            async with aio_timeout(TIMEOUT_S):
                 resp = await session.get(url, headers=headers, allow_redirects=True)
             if resp.status == 200:
                 return resp
             if resp.status in (429, 500, 502, 503, 504):
-                # rispetto Retry-After se presente
                 ra = resp.headers.get("Retry-After")
-                wait_s = float(ra) if ra and ra.isdigit() else backoff + random.uniform(0, JITTER_S)
+                wait_s = float(ra) if (ra and ra.isdigit()) else backoff + random.uniform(0, JITTER_S)
                 await asyncio.sleep(min(60, wait_s))
                 backoff = min(backoff * 2, 30)
             else:
                 text = await resp.text(errors="ignore")
                 raise RuntimeError(f"HTTP {resp.status}: {text[:200]}")
-        except Exception as e:
-            # timeout / reset / ecc.
+        except Exception:
             await asyncio.sleep(backoff + random.uniform(0, JITTER_S))
             backoff = min(backoff * 2, 30)
     raise RuntimeError(f"Max retries exceeded for {url}")
 
 # ---------------------- Parsing ----------------------
-RE_DATE = re.compile(r"(\d{1,2}\s+[A-Za-zàéìòù]{3,}\s+\d{4}\s+\d{1,2}:\d{2})")  # es. 30 giu 2025 13:35
-RE_CITY = re.compile(r"(?:a|in)\s+(?:sede|hub|filiale|deposito)?\s*([A-Za-zÀ-ÖØ-öø-ÿ'\\- ]{2,})", re.I)
+RE_DATE = re.compile(r"(\d{1,2}\s+[A-Za-zàéìòù]{3,}\s+\d{4}\s+\d{1,2}:\d{2})")  # 30 giu 2025 13:35
+# trattino all'inizio per evitare range (safe su Python 3.13), aggiunti ’ e .
+RE_CITY = re.compile(r"(?:\ba|\bin)\s+(?:sede|hub|filiale|deposito)?\s*([-A-Za-zÀ-ÖØ-öø-ÿ'’ .]{2,})", re.I)
 
 def parse_events_from_html(html: str):
     """
@@ -132,11 +158,9 @@ def parse_events_from_html(html: str):
         txt = sc.string or sc.text or ""
         if "event" in txt.lower() and "timestamp" in txt.lower():
             try:
-                # estrai il primo oggetto JSON plausibile
                 by_brace = re.search(r"\{.*\}", txt, re.S)
                 if by_brace:
                     obj = json.loads(by_brace.group(0))
-                    # cerca arrays chiamati events / history
                     cand = obj.get("events") or obj.get("history") or []
                     for ev in cand:
                         ts = ev.get("timestamp") or ev.get("time")
@@ -146,7 +170,7 @@ def parse_events_from_html(html: str):
                             try:
                                 t_iso = dtparse.parse(ts).astimezone(timezone.utc).isoformat()
                                 events.append({"event_time_iso": t_iso, "description": desc, "location": loc})
-                            except:  # noqa
+                            except Exception:
                                 pass
                     if events:
                         break
@@ -157,7 +181,6 @@ def parse_events_from_html(html: str):
     if not events:
         rows = soup.select("tr, li, div.timeline-row, div.track-row")
         for r in rows:
-            # timestamp
             ttxt = " ".join([x.get_text(" ", strip=True) for x in r.select(".time,.date,.timestamp,.gls-time")]) or r.get_text(" ", strip=True)
             m = RE_DATE.search(ttxt)
             ts = None
@@ -166,12 +189,10 @@ def parse_events_from_html(html: str):
                     ts = dtparse.parse(m.group(1), dayfirst=True)
                 except Exception:
                     ts = None
-            # desc/location
             desc = (r.select_one(".desc,.text,.status,.gls-status") or r).get_text(" ", strip=True)
             loc_elm = r.select_one(".place,.location,.city,.office,.center")
             loc = (loc_elm.get_text(" ", strip=True) if loc_elm else None)
             if not loc:
-                # tenta regex su frase
                 mm = RE_CITY.search(desc)
                 if mm:
                     loc = mm.group(1).strip()
@@ -187,7 +208,6 @@ def parse_events_from_html(html: str):
         for m in RE_DATE.finditer(html):
             try:
                 ts = dtparse.parse(m.group(1), dayfirst=True)
-                # prendi 120 char intorno come descrizione
                 start = max(0, m.start() - 120)
                 end = min(len(html), m.end() + 120)
                 ctx = re.sub(r"<[^>]+>", " ", html[start:end])
@@ -226,7 +246,6 @@ def stops_from_events(events):
     if not events:
         return []
 
-    # normalizza location
     def norm_loc(s):
         s = (s or "").strip()
         s = re.sub(r"(?i)(sede|filiale|hub|centro|deposito|gls|centro smistamento|parcel center)", "", s)
@@ -237,7 +256,6 @@ def stops_from_events(events):
 
     stops = []
     if not enriched[0]["loc"]:
-        # prova a ereditare dalla prima con loc disponibile
         for e in enriched:
             if e["loc"]:
                 enriched[0]["loc"] = e["loc"]; break
@@ -249,30 +267,24 @@ def stops_from_events(events):
     for i in range(1, len(enriched)):
         e = enriched[i]
         if e["loc"] != current_loc and e["loc"]:
-            # cambio checkpoint => chiudo il precedente
             departure = e["t"]  # partenza implicita
             stops.append({"checkpoint": current_loc, "arrival_at": arrival, "departure_at": departure})
-            # apertura nuovo
             current_loc = e["loc"]
             arrival = e["t"]
             departure = None
         else:
-            # stesso checkpoint: cerca uscita esplicita
             if DEP_PAT.search(e["desc"]) and not departure:
                 departure = e["t"]
                 stops.append({"checkpoint": current_loc, "arrival_at": arrival, "departure_at": departure})
-                # in molti flussi si rimane nello stesso loc ma in “transito”: riapriamo solo se cambia poi
-                arrival = e["t"]  # opzionale; qui manteniamo semplice
+                arrival = e["t"]
 
-    # ultimo aperto senza chiusura
     if arrival and (not stops or stops[-1]["checkpoint"] != current_loc):
         stops.append({"checkpoint": current_loc, "arrival_at": arrival, "departure_at": None})
 
-    # calcola dwell
     for s in stops:
         if s["arrival_at"] and s["departure_at"]:
-            t1 = datetime.fromisoformat(s["arrival_at"].replace("Z","")).timestamp()
-            t2 = datetime.fromisoformat(s["departure_at"].replace("Z","")).timestamp()
+            t1 = datetime.fromisoformat(s["arrival_at"].replace("Z",""))
+            t2 = datetime.fromisoformat(s["departure_at"].replace("Z",""))
             s["dwell_hours"] = max(0.0, (t2 - t1) / 3600.0)
         else:
             s["dwell_hours"] = None
@@ -280,7 +292,7 @@ def stops_from_events(events):
 
 # ---------------------- Pipeline ----------------------
 stop_flag = False
-def _sigint(*args):
+def _sigint(*_):
     global stop_flag
     stop_flag = True
 signal.signal(signal.SIGINT, _sigint)
@@ -302,34 +314,38 @@ async def fetch_and_parse(session, url: str):
     return {"tracking_id": tid, "url": url, "events": events, "stops": stops}
 
 async def run_csv(in_csv: str, out_events_csv: str, out_stops_csv: str):
-    # leggi lista URL (colonna 'url' o prima colonna senza header)
-    # pandas per robustezza
+    # lettura CSV robusta
     try:
         df = pd.read_csv(in_csv)
-        if "url" in df.columns:
-            urls = df["url"].dropna().astype(str).tolist()
-        else:
-            urls = df.iloc[:,0].dropna().astype(str).tolist()
     except Exception:
-        # CSV separato da ; eventualmente
-        df = pd.read_csv(in_csv, sep=";")
-        urls = (df["url"] if "url" in df.columns else df.iloc[:,0]).dropna().astype(str).tolist()
+        try:
+            df = pd.read_csv(in_csv, sep=";")
+        except Exception:
+            df = pd.read_csv(in_csv, engine="python")
 
-    # dedup & ordina per tracking id (stabilità)
-    seen = set(); ordered = []
+    if "url" in df.columns:
+        urls = df["url"].dropna().astype(str).tolist()
+    else:
+        urls = df.iloc[:, 0].dropna().astype(str).tolist()
+
+    # dedup (per tracking_id)
+    seen: set[str] = set()
+    ordered: list[str] = []
     for u in urls:
         tid = extract_tracking_id(u)
         if tid not in seen:
-            seen.add(tid); ordered.append(u)
+            seen.add(tid)
+            ordered.append(u)
 
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=12, sock_read=12)
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=TIMEOUT_S, sock_read=TIMEOUT_S)
     connector = aiohttp.TCPConnector(limit_per_host=CONCURRENCY, ssl=False)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         sem = asyncio.Semaphore(CONCURRENCY)
-        results = []
+        results: list[dict] = []
 
         pbar = tqdm(total=len(ordered), desc="Download/Parse", unit="trk")
-        async def worker(u):
+
+        async def worker(u: str):
             nonlocal results
             async with sem:
                 try:
@@ -344,33 +360,30 @@ async def run_csv(in_csv: str, out_events_csv: str, out_stops_csv: str):
         await asyncio.gather(*tasks)
         pbar.close()
 
-    # salva events
-    ev_rows = []
-    st_rows = []
+    ev_rows: list[dict] = []
+    st_rows: list[dict] = []
     for r in results:
         tid = r.get("tracking_id")
         url = r.get("url")
-        if "events" in r and r["events"]:
-            for ev in r["events"]:
-                ev_rows.append({
-                    "tracking_id": tid,
-                    "url": url,
-                    "event_time_iso": ev.get("event_time_iso"),
-                    "description": ev.get("description"),
-                    "location": ev.get("location"),
-                    "ingested_at": now_utc()
-                })
-        if "stops" in r and r["stops"]:
-            for s in r["stops"]:
-                st_rows.append({
-                    "tracking_id": tid,
-                    "url": url,
-                    "checkpoint": s.get("checkpoint"),
-                    "arrival_at": s.get("arrival_at"),
-                    "departure_at": s.get("departure_at"),
-                    "dwell_hours": s.get("dwell_hours"),
-                    "ingested_at": now_utc()
-                })
+        for ev in r.get("events", []) or []:
+            ev_rows.append({
+                "tracking_id": tid,
+                "url": url,
+                "event_time_iso": ev.get("event_time_iso"),
+                "description": ev.get("description"),
+                "location": ev.get("location"),
+                "ingested_at": now_utc(),
+            })
+        for s in r.get("stops", []) or []:
+            st_rows.append({
+                "tracking_id": tid,
+                "url": url,
+                "checkpoint": s.get("checkpoint"),
+                "arrival_at": s.get("arrival_at"),
+                "departure_at": s.get("departure_at"),
+                "dwell_hours": s.get("dwell_hours"),
+                "ingested_at": now_utc(),
+            })
 
     pd.DataFrame(ev_rows).to_csv(out_events_csv, index=False)
     pd.DataFrame(st_rows).to_csv(out_stops_csv, index=False)
@@ -383,4 +396,7 @@ if __name__ == "__main__":
     in_csv = sys.argv[1]
     events_out = sys.argv[2] if len(sys.argv) > 2 else str(OUT_DIR / "events.csv")
     stops_out  = sys.argv[3] if len(sys.argv) > 3 else str(OUT_DIR / "stops.csv")
-    asyncio.run(run_csv(in_csv, events_out, stops_out))
+    try:
+        asyncio.run(run_csv(in_csv, events_out, stops_out))
+    except KeyboardInterrupt:
+        print("\nInterrotto dall'utente.")
