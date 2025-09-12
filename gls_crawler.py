@@ -362,6 +362,7 @@ async def run_csv(in_csv: str, out_events_csv: str, out_stops_csv: str):
 
     ev_rows: list[dict] = []
     st_rows: list[dict] = []
+    err_rows: list[dict] = []
     for r in results:
         tid = r.get("tracking_id")
         url = r.get("url")
@@ -384,9 +385,21 @@ async def run_csv(in_csv: str, out_events_csv: str, out_stops_csv: str):
                 "dwell_hours": s.get("dwell_hours"),
                 "ingested_at": now_utc(),
             })
+        if r.get("error"):
+            err_rows.append({
+                "tracking_id": tid,
+                "url": url,
+                "error": r.get("error"),
+                "ingested_at": now_utc(),
+            })
 
-    pd.DataFrame(ev_rows).to_csv(out_events_csv, index=False)
-    pd.DataFrame(st_rows).to_csv(out_stops_csv, index=False)
+    ev_cols = ["tracking_id", "url", "event_time_iso", "description", "location", "ingested_at"]
+    st_cols = ["tracking_id", "url", "checkpoint", "arrival_at", "departure_at", "dwell_hours", "ingested_at"]
+    err_cols = ["tracking_id", "url", "error", "ingested_at"]
+
+    pd.DataFrame(ev_rows, columns=ev_cols).to_csv(out_events_csv, index=False)
+    pd.DataFrame(st_rows, columns=st_cols).to_csv(out_stops_csv, index=False)
+    pd.DataFrame(err_rows, columns=err_cols).to_csv(OUT_DIR / "errors.csv", index=False)
 
 # ---------------------- Entrypoint ----------------------
 if __name__ == "__main__":
