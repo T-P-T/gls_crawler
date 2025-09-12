@@ -20,6 +20,7 @@ per le soste.
 from pathlib import Path
 import sys
 import pandas as pd
+from tqdm import tqdm
 
 # Importa le funzioni di parsing dallo script principale
 from gls_crawler import (
@@ -56,12 +57,20 @@ def parse_cache(csv_path: str | None, events_out: Path, stops_out: Path) -> None
     events_rows: list[dict] = []
     stops_rows: list[dict] = []
 
-    for html_file in sorted((RAW_DIR).glob("*.html")):
+    for html_file in tqdm(sorted(RAW_DIR.glob("*.html")), desc="Parsing cache"):
         tid = html_file.stem
         url = url_map.get(tid, "")
         html = html_file.read_text(errors="ignore")
         events = parse_events_from_html(html)
         stops = stops_from_events(events)
+
+        print(f"== {tid} ==")
+        for st in stops:
+            checkpoint = st.get("checkpoint")
+            print(f"spedizione verso: {checkpoint}")
+            print(f"arrivo a {checkpoint} alle h {st.get('arrival_at')}")
+            print(f"partenza da {checkpoint} alle h {st.get('departure_at')}")
+            print("---")
 
         for ev in events:
             events_rows.append({
